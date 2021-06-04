@@ -1,9 +1,11 @@
 package restapi
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -19,6 +21,9 @@ import (
 	graceful "github.com/tylerb/graceful"
 
 	"github.com/cilium/starwars-docker/restapi/operations"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
 const (
@@ -28,6 +33,10 @@ const (
 )
 
 var defaultSchemes []string
+
+// Worload API socket path
+//const socketPath = "unix:///tmp/spire-agent/public/api.sock"
+// const socketPath = "unix:///run/spire/sockets/agent.sock"
 
 func init() {
 	defaultSchemes = []string{
@@ -41,6 +50,39 @@ func NewServer(api *operations.DeathstarAPI) *Server {
 
 	s.api = api
 	return s
+}
+
+func (s *Server) ServeSPIFFE() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Set up a `/` resource handler
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Println("Request received")
+		_, _ = io.WriteString(w, "Success!!!")
+	})
+
+	// Create a `workloadapi.X509Source`, it will connect to Workload API using provided socket.
+	// If socket path is not defined using `workloadapi.SourceOption`, value from environment variable `SPIFFE_ENDPOINT_SOCKET` is used.
+	source, err := workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(string(s.SocketPath))))
+	if err != nil {
+		log.Fatalf("Unable to create X509Source: %v", err)
+	}
+	defer source.Close()
+
+	// Allowed SPIFFE ID
+	clientID := spiffeid.Must("example.org", "ns/default/sa/default")
+
+	// Create a `tls.Config` to allow mTLS connections, and verify that presented certificate has SPIFFE ID `spiffe://example.org/client`
+	tlsConfig := tlsconfig.MTLSServerConfig(source, source, tlsconfig.AuthorizeID(clientID))
+	//tlsConfig := tlsconfig.TLSServerConfig(source)
+	s.server = &http.Server{
+		Addr:      ":8443",
+		TLSConfig: tlsConfig,
+	}
+	if err := s.server.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("Error on serve: %v", err)
+	}
 }
 
 // ConfigureAPI configures the API and handlers.
@@ -72,6 +114,7 @@ type Server struct {
 	KeepAlive    time.Duration `long:"keep-alive" description:"sets the TCP keep-alive timeouts on accepted connections. It prunes dead TCP connections ( e.g. closing laptop mid-download)" default:"3m"`
 	ReadTimeout  time.Duration `long:"read-timeout" description:"maximum duration before timing out read of the request" default:"30s"`
 	WriteTimeout time.Duration `long:"write-timeout" description:"maximum duration before timing out write of the response" default:"60s"`
+	EnableSpiffe int           `long:"enable-spiffe" description:"enable spiffe support" default:"0"`
 	httpServerL  net.Listener
 
 	TLSHost           string         `long:"tls-host" description:"the IP to listen on for tls, when not specified it's the same as --host" env:"TLS_HOST"`
@@ -88,6 +131,7 @@ type Server struct {
 	api          *operations.DeathstarAPI
 	handler      http.Handler
 	hasListeners bool
+	server       *http.Server
 }
 
 // Logf logs message either via defined user logger or via system one if no user logger is defined.
@@ -210,88 +254,92 @@ func (s *Server) Serve() (err error) {
 	}
 
 	if s.hasScheme(schemeHTTPS) {
-		httpsServer := &graceful.Server{Server: new(http.Server)}
-		httpsServer.MaxHeaderBytes = int(s.MaxHeaderSize)
-		httpsServer.ReadTimeout = s.TLSReadTimeout
-		httpsServer.WriteTimeout = s.TLSWriteTimeout
-		httpsServer.SetKeepAlivesEnabled(int64(s.TLSKeepAlive) > 0)
-		httpsServer.TCPKeepAlive = s.TLSKeepAlive
-		if s.TLSListenLimit > 0 {
-			httpsServer.ListenLimit = s.TLSListenLimit
-		}
-		if int64(s.CleanupTimeout) > 0 {
-			httpsServer.Timeout = s.CleanupTimeout
-		}
-		httpsServer.Handler = s.handler
-		httpsServer.LogFunc = s.Logf
-
-		// Inspired by https://blog.bracebin.com/achieving-perfect-ssl-labs-score-with-go
-		httpsServer.TLSConfig = &tls.Config{
-			// Causes servers to use Go's default ciphersuite preferences,
-			// which are tuned to avoid attacks. Does nothing on clients.
-			PreferServerCipherSuites: true,
-			// Only use curves which have assembly implementations
-			// https://github.com/golang/go/tree/master/src/crypto/elliptic
-			CurvePreferences: []tls.CurveID{tls.CurveP256},
-			// Use modern tls mode https://wiki.mozilla.org/Security/Server_Side_TLS#Modern_compatibility
-			NextProtos: []string{"http/1.1", "h2"},
-			// https://www.owasp.org/index.php/Transport_Layer_Protection_Cheat_Sheet#Rule_-_Only_Support_Strong_Protocols
-			MinVersion: tls.VersionTLS12,
-			// These ciphersuites support Forward Secrecy: https://en.wikipedia.org/wiki/Forward_secrecy
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			},
-		}
-
-		if s.TLSCertificate != "" && s.TLSCertificateKey != "" {
-			httpsServer.TLSConfig.Certificates = make([]tls.Certificate, 1)
-			httpsServer.TLSConfig.Certificates[0], err = tls.LoadX509KeyPair(string(s.TLSCertificate), string(s.TLSCertificateKey))
-		}
-
-		if s.TLSCACertificate != "" {
-			caCert, err := ioutil.ReadFile(string(s.TLSCACertificate))
-			if err != nil {
-				log.Fatal(err)
+		if s.EnableSpiffe != 0 {
+			s.ServeSPIFFE()
+		} else {
+			httpsServer := &graceful.Server{Server: new(http.Server)}
+			httpsServer.MaxHeaderBytes = int(s.MaxHeaderSize)
+			httpsServer.ReadTimeout = s.TLSReadTimeout
+			httpsServer.WriteTimeout = s.TLSWriteTimeout
+			httpsServer.SetKeepAlivesEnabled(int64(s.TLSKeepAlive) > 0)
+			httpsServer.TCPKeepAlive = s.TLSKeepAlive
+			if s.TLSListenLimit > 0 {
+				httpsServer.ListenLimit = s.TLSListenLimit
 			}
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(caCert)
-			httpsServer.TLSConfig.ClientCAs = caCertPool
-			httpsServer.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		}
+			if int64(s.CleanupTimeout) > 0 {
+				httpsServer.Timeout = s.CleanupTimeout
+			}
+			httpsServer.Handler = s.handler
+			httpsServer.LogFunc = s.Logf
 
-		configureTLS(httpsServer.TLSConfig)
-		httpsServer.TLSConfig.BuildNameToCertificate()
+			// Inspired by https://blog.bracebin.com/achieving-perfect-ssl-labs-score-with-go
+			httpsServer.TLSConfig = &tls.Config{
+				// Causes servers to use Go's default ciphersuite preferences,
+				// which are tuned to avoid attacks. Does nothing on clients.
+				PreferServerCipherSuites: true,
+				// Only use curves which have assembly implementations
+				// https://github.com/golang/go/tree/master/src/crypto/elliptic
+				CurvePreferences: []tls.CurveID{tls.CurveP256},
+				// Use modern tls mode https://wiki.mozilla.org/Security/Server_Side_TLS#Modern_compatibility
+				NextProtos: []string{"http/1.1", "h2"},
+				// https://www.owasp.org/index.php/Transport_Layer_Protection_Cheat_Sheet#Rule_-_Only_Support_Strong_Protocols
+				MinVersion: tls.VersionTLS12,
+				// These ciphersuites support Forward Secrecy: https://en.wikipedia.org/wiki/Forward_secrecy
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				},
+			}
 
-		if err != nil {
-			return err
-		}
+			if s.TLSCertificate != "" && s.TLSCertificateKey != "" {
+				httpsServer.TLSConfig.Certificates = make([]tls.Certificate, 1)
+				httpsServer.TLSConfig.Certificates[0], err = tls.LoadX509KeyPair(string(s.TLSCertificate), string(s.TLSCertificateKey))
+			}
 
-		if len(httpsServer.TLSConfig.Certificates) == 0 {
-			if s.TLSCertificate == "" {
-				if s.TLSCertificateKey == "" {
-					s.Fatalf("the required flags `--tls-certificate` and `--tls-key` were not specified")
+			if s.TLSCACertificate != "" {
+				caCert, err := ioutil.ReadFile(string(s.TLSCACertificate))
+				if err != nil {
+					log.Fatal(err)
 				}
-				s.Fatalf("the required flag `--tls-certificate` was not specified")
+				caCertPool := x509.NewCertPool()
+				caCertPool.AppendCertsFromPEM(caCert)
+				httpsServer.TLSConfig.ClientCAs = caCertPool
+				httpsServer.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
 			}
-			if s.TLSCertificateKey == "" {
-				s.Fatalf("the required flag `--tls-key` was not specified")
+
+			configureTLS(httpsServer.TLSConfig)
+			httpsServer.TLSConfig.BuildNameToCertificate()
+
+			if err != nil {
+				return err
 			}
+
+			if len(httpsServer.TLSConfig.Certificates) == 0 {
+				if s.TLSCertificate == "" {
+					if s.TLSCertificateKey == "" {
+						s.Fatalf("the required flags `--tls-certificate` and `--tls-key` were not specified")
+					}
+					s.Fatalf("the required flag `--tls-certificate` was not specified")
+				}
+				if s.TLSCertificateKey == "" {
+					s.Fatalf("the required flag `--tls-key` was not specified")
+				}
+			}
+
+			configureServer(httpsServer, "https")
+
+			wg.Add(1)
+			s.Logf("Serving deathstar at https://%s", s.httpsServerL.Addr())
+			go func(l net.Listener) {
+				defer wg.Done()
+				if err := httpsServer.Serve(l); err != nil {
+					s.Fatalf("%v", err)
+				}
+				s.Logf("Stopped serving deathstar at https://%s", l.Addr())
+			}(tls.NewListener(s.httpsServerL, httpsServer.TLSConfig))
 		}
-
-		configureServer(httpsServer, "https")
-
-		wg.Add(1)
-		s.Logf("Serving deathstar at https://%s", s.httpsServerL.Addr())
-		go func(l net.Listener) {
-			defer wg.Done()
-			if err := httpsServer.Serve(l); err != nil {
-				s.Fatalf("%v", err)
-			}
-			s.Logf("Stopped serving deathstar at https://%s", l.Addr())
-		}(tls.NewListener(s.httpsServerL, httpsServer.TLSConfig))
 	}
 
 	wg.Wait()
